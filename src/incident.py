@@ -12,10 +12,51 @@ from flask_login import LoginManager, login_user, logout_user
 from flask_user import current_user, login_required, roles_required, UserManager, UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_session import Session
+from flask_restx import Resource, Api, fields as f
 import redis
 
 
 app = Flask(__name__)
+api = Api(app, version='1.0', title='Incident Management API', description='API for managing incidents and categories')
+
+user_model = api.model('Users', {
+    'email': f.String(required=True, description='User email'),
+    'password': f.String(required=True, description='User password'),
+    'first_name': f.String(required=True, description='User first_name'),
+    'last_name': f.String(required=True, description='User last_name')
+})
+
+login_model = api.model('Login', {
+    'email': f.String(required=True, description='User email'),
+    'password': f.String(required=True, description='User password')
+})
+
+userid_model = api.model('UserID', {
+    'user_id': f.String(required=True, description='User id')
+})
+
+category_model = api.model('Category', {
+    'name': f.String(required=True, description='Category name')
+}) 
+
+incident_model = api.model('Incident', {
+    'name': f.String(required=True, description='Incident name'),
+    'description': f.String(required=True, description='Incident description'),
+    'state': f.String(
+        required=True,
+        description='Incident state',
+        enum=["Resolved", "Maintenance", "Firing"],
+        enum_error_message='Invalid state value. Allowed values are: Resolved, Maintenance, Firing'
+    )
+})
+
+delete_incident_model = api.model('Delete Incident', {
+    'id': f.String(required=True, description='Incident id')
+})
+
+user_ns = api.namespace('users', description='users operations') 
+category_ns = api.namespace('categories', description='Category operations') 
+incident_ns = api.namespace('incidents', description='Incident operations')
 
 app.config['SECRET_KEY'] = config.APP_SECRET_KEY
 app.config['SQLALCHEMY_DATABASE_URI'] = config.DB_URI
@@ -97,158 +138,232 @@ class IncidentSchema(Schema):
     description = fields.Str(required=True)
     state = fields.Str(required=True, validate=validate.OneOf(["Resolved", "Maintenance", "Firing"])) 
 
-@app.route('/register', methods=['POST'])
-def register():
-    email = request.json['email']
-    password = request.json['password']
-    first_name = request.json['first_name']
-    last_name = request.json['last_name']
+@user_ns.route('/register', methods=['POST'])
+class Register(Resource):
+    @api.doc(responses={201: 'User created', 400: 'User creation failed'}) 
+    @api.expect(user_model)
+    def post(self):
+        email = request.json['email']
+        password = request.json['password']
+        first_name = request.json['first_name']
+        last_name = request.json['last_name']
 
-    if User.query.filter_by(email=email).first():
-        return jsonify({'message': 'Email already registered'}), 400
+        if User.query.filter_by(email=email).first():
+            return {'message': 'Email already registered'}, 400
 
-    hashed_password = generate_password_hash(password)
-    user = User(email=email, password=hashed_password, first_name=first_name, last_name=last_name)
-    db.session.add(user)
-    db.session.commit()
+        hashed_password = generate_password_hash(password)
+        user = User(email=email, password=hashed_password, first_name=first_name, last_name=last_name)
+        db.session.add(user)
+        db.session.commit()
 
-    member_role = Role.query.filter_by(name='Member').first()
+        member_role = Role.query.filter_by(name='Member').first()
 
-    if member_role is None:
-        member_role = Role(name='Member')
-        db.session.add(member_role)
+        if member_role is None:
+            member_role = Role(name='Member')
+            db.session.add(member_role)
 
-    user.roles.append(member_role)
-    db.session.commit()
+        user.roles.append(member_role)
+        db.session.commit()
 
-    return jsonify({'message': 'Registration successful'}), 201
+        return {'message': 'Registration successful'}, 201
 
-@app.route('/login', methods=['POST'])
-def login():
-    if 'username' in session:
+@user_ns.route('/login', methods=['POST'])
+class Login(Resource):
+    @api.doc(responses={200: 'User login successfully', 401: 'Invalid email or password'}) 
+    @api.expect(login_model)    
+    def post(self):
+        if 'username' in session:
             response_dict = {'message': 'You have been logged in'}
-            return jsonify(response_dict), 200
-    
-    email = request.json['email']
-    password = request.json['password']
+            return response_dict, 200
+        
+        email = request.json['email']
+        password = request.json['password']
 
-    user = User.query.filter((User.email==email) & (User.active=='1')).first()
+        user = User.query.filter((User.email==email) & (User.active=='1')).first()
 
-    if not user or not check_password_hash(user.password, password):
-        return jsonify({'message': 'Invalid email or password'}), 401
+        if not user or not check_password_hash(user.password, password):
+            return {'message': 'Invalid email or password'}, 401
 
-    login_user(user)
-    session['logged_in'] = True
-    session['username'] = user.email
-    session['uuid'] = user.id
+        login_user(user)
+        session['logged_in'] = True
+        session['username'] = user.email
+        session['uuid'] = user.id
 
-    return jsonify({'message': 'Login successful'}), 200
+        return {'message': 'Login successful'}, 200
 
-@app.route('/logout', methods=['POST'])
-@login_required
-def logout():
-    logout_user()
-    session.pop('username', None)
-    return jsonify({'message': 'Logout successful'}), 200
+@user_ns.route('/logout', methods=['POST'])
+class Logout(Resource):
+    @login_required
+    def post(self):
+        logout_user()
+        session.pop('username', None)
+        return {'message': 'Logout successful'}, 200
 
-@app.route('/users/pending', methods=['GET'])
-@roles_required('Admin')
-def list_pending_users():
-    pending_users = User.query.filter_by(active='0').all()
-    return jsonify({'pending_users': [{'user_id': user.id, 'email': user.email} for user in pending_users]}), 200
+@user_ns.route('/pending', methods=['GET'])
+class PendingUsers(Resource):
+    @roles_required('Admin')
+    @api.doc(responses={200: 'List pending users successfully', 403: 'Permission denied'}) 
+    def get(self):
+        pending_users = User.query.filter_by(active='0').all()
+        return {'pending_users': [{'user_id': user.id, 'email': user.email} for user in pending_users]}, 200
 
-@app.route('/users/activate', methods=['POST'])
-@roles_required('Admin')
-def activate_user():
-    user_id = request.json['user_id']
-    user = User.query.get(user_id)
+@user_ns.route('/activate', methods=['POST'])
+class ActivateUsers(Resource):
+    @roles_required('Admin')
+    @api.doc(responses={200: 'User activated successfully', 404: 'User not found'}) 
+    @api.expect(userid_model)  
+    def post(self):
+        user_id = request.json['user_id']
+        user = User.query.get(user_id)
 
-    if not user:
-        return jsonify({'message': 'User not found'}), 404
+        if not user:
+            return {'message': 'User not found'}, 404
 
-    user.active = True
-    db.session.commit()
+        user.active = True
+        db.session.commit()
 
-    return jsonify({'message': 'User activated successfully'}), 200
+        return {'message': 'User activated successfully'}, 200
 
-# Create Category API 
-@app.route('/categories', methods=['POST']) 
-@roles_required('Admin')
-def create_category(): 
-    category_name = request.json['name'] 
-    try:
-        incident_db.create_collection(category_name)
-        return jsonify({'message': 'Category created successfully'}), 201 
-    except:
-        return jsonify({'message': 'Category creation failed'}), 400 
+# Category API 
+@category_ns.route('/', methods=['GET', 'POST', 'DELETE']) 
+class Category(Resource):
+    @roles_required('Admin')
+    @api.doc(responses={201: 'Category created', 400: 'Category creation failed'}) 
+    @api.expect(category_model)
+    def post(self):
+        category_name = request.json['name'] 
+        try:
+            incident_db.create_collection(category_name)
+            return {'message': 'Category created successfully'}, 201 
+        except:
+            return {'message': 'Category creation failed'}, 400 
 
-# List Category API 
-@app.route('/categories', methods=['GET']) 
-@login_required
-def list_category(): 
-    if not current_user.active:
-        return jsonify({'message': 'Access denied. User is not active'}), 403
-    
-    try:
-        filter = {"name": {"$regex": r"^(?!system\.)"}}
-        categories = incident_db.list_collection_names(filter=filter)
-        return jsonify(categories), 201 
-    except:
-        return jsonify({'message': 'Can not fetch categories'}), 400 
+    @login_required
+    @api.doc(responses={200: 'Categories listed', 400: 'Failed to fetch categories'})
+    def get(self):
+        try:
+            filter = {"name": {"$regex": r"^(?!system\.)"}}
+            categories = incident_db.list_collection_names(filter=filter)
+            return categories, 200
+        except:
+            return {'message': 'Can not fetch categories'}, 400 
 
-# Create Incident API 
-@app.route('/categories/<category_name>/incidents', methods=['POST']) 
-@roles_required('Admin')
-def create_incident(category_name): 
-    filter = {"name": category_name}
-    category = incident_db.list_collection_names(filter=filter)
-    if not category: 
-        return jsonify({'message': 'Category does not exist'}), 404 
-    
-    try: 
-        incident_data = IncidentSchema().load(request.json)
-    except ValidationError as err: 
-        return jsonify(err.messages), 400 
+    @roles_required('Admin')
+    @api.doc(responses={201: 'Category deleted', 400: 'Category deletion failed'}) 
+    @api.expect([category_model])
+    def delete(self):
+        try:
+            categories = request.json
+            for category in categories:
+                category_name = category['name']
+                filter = {'name': category_name}
+                existing_category = incident_db.list_collection_names(filter=filter)
 
-    incident_data['date'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
-    incident_data['last_modified'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
-    result = incident_db.category_name.insert_one(incident_data) 
+                if existing_category:
+                    incident_db.drop_collection(category_name)
+                else:
+                    return {'message': f'Category {category_name} does not exist'}, 400 
 
-    return jsonify({'message': 'Incident created successfully', 'id': str(result.inserted_id)}), 201
+            return {'message': 'Categories deleted successfully'}, 201
+        except:
+            return {'message': 'Can not delete categories'}, 400 
+
+# Incident API 
+@incident_ns.route('/<category_name>', methods=['GET', 'POST', 'DELETE']) 
+class Incident(Resource): 
+    @roles_required('Admin')
+    @api.doc(responses={201: 'Incident created', 400: 'Incident creation failed', 404: 'Category not found'}) 
+    @api.expect(incident_model)
+    def post(self, category_name):
+        filter = {"name": category_name}
+        category = incident_db.list_collection_names(filter=filter)
+        if not category: 
+            return {'message': 'Category does not exist'}, 404 
+        
+        try: 
+            incident_data = IncidentSchema().load(request.json)
+        except ValidationError as err: 
+            return err.messages, 400 
+
+        incident_data['date'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
+        incident_data['last_modified'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
+        result = incident_db.category_name.insert_one(incident_data) 
+
+        return {'message': 'Incident created successfully', 'id': str(result.inserted_id)}, 201
+
+    @login_required
+    @api.doc(responses={200: 'Incidents listed', 400: 'Failed to fetch incidents', 404: 'Category not found'})
+    def get(self, category_name):
+        try:
+            filter = {"name": category_name}
+            category = incident_db.list_collection_names(filter=filter)
+            if not category:
+                return {'message': 'Category does not exist'}, 404 
+            
+            incidents = list(incident_db.category_name.find({})) 
+
+            return json.loads(json_util.dumps(incidents)), 200 
+        
+        except:
+            return {'message': 'Failed to fetch incidents'}, 400 
+
+    @roles_required('Admin')
+    @api.doc(responses={201: 'Incidents deleted', 400: 'Failed to delete incidents', 404: 'Incident not found'})
+    @api.expect([delete_incident_model])
+    def delete(self, category_name):
+        deleted_count = []
+        incidents = request.json
+
+        filter = {"name": category_name}
+        category = incident_db.list_collection_names(filter=filter)
+
+        if not category:
+            return {'message': 'Category does not exist'}, 404 
+
+        for incident in incidents:
+            incident_id = incident['id']
+            result = incident_db.category_name.delete_one({'_id': ObjectId(incident_id)})
+            deleted_count.append(int(result.deleted_count))
+
+        if all(deleted_count): 
+            return {'message': 'Incident deleted successfully'}, 201
+        else: 
+            return {'message': 'Incident not found'}, 404
 
 # Update Incident API 
-@app.route('/categories/<category_name>/incidents/<incident_id>', methods=['PUT']) 
-@roles_required('Admin')
-def update_incident(category_name, incident_id): 
-    filter = {"name": category_name}
-    category = incident_db.list_collection_names(filter=filter)
-    if not category:
-        return jsonify({'message': 'Category does not exist'}), 404 
+@incident_ns.route('/<category_name>/<incident_id>', methods=['PUT', 'DELETE'])
+class UpdateIncident(Resource):
+    @roles_required('Admin')
+    @api.doc(responses={201: 'Incident updated', 400: 'Failed to update incident', 404: 'Incident not found'}) 
+    @api.expect(incident_model)
+    def put(self, category_name, incident_id):
+        filter = {"name": category_name}
+        category = incident_db.list_collection_names(filter=filter)
+        if not category:
+            return {'message': 'Category does not exist'}, 404 
+        
+        try: 
+            incident_data = IncidentSchema().load(request.json)
+            incident_data['last_modified'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
+        except ValidationError as err: 
+            return err.messages, 400 
+        
+        result = incident_db.category_name.update_one({'_id': ObjectId(incident_id)}, {'$set': incident_data}) 
+        if result.modified_count == 1: 
+            return {'message': 'Incident updated successfully'}, 201
+        else: 
+            return {'message': 'Incident not found'}, 404 
     
-    try: 
-        incident_data = IncidentSchema().load(request.json)
-        incident_data['last_modified'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
-    except ValidationError as err: 
-        return jsonify(err.messages), 400 
-    
-    result = incident_db.category_name.update_one({'_id': ObjectId(incident_id)}, {'$set': incident_data}) 
-    if result.modified_count == 1: 
-        return jsonify({'message': 'Incident updated successfully'}), 200 
-    else: 
-        return jsonify({'message': 'Incident not found'}), 404 
-    
-# List Incidents API 
-@app.route('/categories/<category_name>/incidents', methods=['GET']) 
-@login_required
-def list_incidents(category_name): 
-    if not current_user.active:
-        return jsonify({'message': 'Access denied. User is not active'}), 403
-
-    filter = {"name": category_name}
-    category = incident_db.list_collection_names(filter=filter)
-    if not category:
-        return jsonify({'message': 'Category does not exist'}), 404 
-    
-    incidents = list(incident_db.category_name.find({})) 
-
-    return jsonify(json.loads(json_util.dumps(incidents))), 200 
+    @roles_required('Admin')
+    @api.doc(responses={201: 'Incident deleted', 400: 'Failed to delete incident', 404: 'Incident not found'}) 
+    def delete(self, category_name, incident_id):
+        filter = {"name": category_name}
+        category = incident_db.list_collection_names(filter=filter)
+        if not category:
+            return {'message': 'Category does not exist'}, 404 
+        
+        result = incident_db.category_name.delete_one({'_id': ObjectId(incident_id)}) 
+        if result.deleted_count == 1: 
+            return {'message': 'Incident deleted successfully'}, 201
+        else: 
+            return {'message': 'Incident not found'}, 404
